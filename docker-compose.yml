@@ -5,11 +5,11 @@ volumes:
   qdrant_storage:
 
 networks:
-  demo:
+  onprem:
 
 x-n8n: &service-n8n
   image: n8nio/n8n:latest
-  networks: ['demo']
+  networks: ['onprem']
   environment:
     - DB_TYPE=postgresdb
     - DB_POSTGRESDB_HOST=postgres
@@ -19,34 +19,15 @@ x-n8n: &service-n8n
     - N8N_PERSONALIZATION_ENABLED=false
     - N8N_ENCRYPTION_KEY
     - N8N_USER_MANAGEMENT_JWT_SECRET
+    # - N8N_SECURE_COOKIE=false
   links:
     - postgres
-
-x-ollama: &service-ollama
-  image: ollama/ollama:latest
-  container_name: ollama
-  networks: ['demo']
-  restart: unless-stopped
-  ports:
-    - 11434:11434
-  volumes:
-    - ollama_storage:/root/.ollama
-
-x-init-ollama: &init-ollama
-  image: ollama/ollama:latest
-  networks: ['demo']
-  container_name: ollama-pull-llama
-  volumes:
-    - ollama_storage:/root/.ollama
-  entrypoint: /bin/sh
-  command:
-    - "-c"
-    - "sleep 3; OLLAMA_HOST=ollama:11434 ollama pull llama3.2"
 
 services:
   postgres:
     image: postgres:16-alpine
-    networks: ['demo']
+    container_name: postgres
+    networks: ['onprem']
     restart: unless-stopped
     environment:
       - POSTGRES_USER
@@ -77,8 +58,8 @@ services:
     <<: *service-n8n
     container_name: n8n
     restart: unless-stopped
-    ports:
-      - 5678:5678
+    expose:
+      - 5678
     volumes:
       - n8n_storage:/home/node/.n8n
       - ./n8n/backup:/backup
@@ -88,40 +69,102 @@ services:
         condition: service_healthy
       n8n-import:
         condition: service_completed_successfully
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`n8n.motivation-inc.com`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.n8n.tls.domains[0].main=n8n.motivation-inc.com"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
 
   qdrant:
     image: qdrant/qdrant
     container_name: qdrant
-    networks: ['demo']
+    networks: ['onprem']
     restart: unless-stopped
-    ports:
-      - 6333:6333
+    # ports:
+    #   - 6333:6333
     volumes:
       - qdrant_storage:/qdrant/storage
 
-  ollama-cpu:
-    profiles: ["cpu"]
-    <<: *service-ollama
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: ollama
+  #   networks: ['onprem']
+  #   restart: unless-stopped
+  #   ports:
+  #     - 11434:11434
+  #   expose:
+  #     - 11434
+  #   volumes:
+  #     - ollama_storage:/root/.ollama
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.ollama.rule=Host(`ollama.motivation-inc.com`)"
+  #     - "traefik.http.routers.ollama.entrypoints=websecure"
+  #     - "traefik.http.routers.ollama.tls.certresolver=letsencrypt"
+  #     - "traefik.http.routers.ollama.tls.domains[0].main=ollama.motivation-inc.com"
+  #     - "traefik.http.services.ollama.loadbalancer.server.port=11434"
 
-  ollama-gpu:
-    profiles: ["gpu-nvidia"]
-    <<: *service-ollama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+  # init-ollama:
+  #   image: ollama/ollama:latest
+  #   networks: ['onprem']
+  #   container_name: ollama-pull-llama
+  #   depends_on:
+  #     - ollama
+  #   volumes:
+  #     - ollama_storage:/root/.ollama
+  #   entrypoint: /bin/sh
+  #   command:
+  #     - "-c"
+  #     - "sleep 3; OLLAMA_HOST=ollama:11434 ollama pull llama3.2"
 
-  ollama-pull-llama-cpu:
-    profiles: ["cpu"]
-    <<: *init-ollama
+  traefik:
+    container_name: traefik
+    image: public.ecr.aws/docker/library/traefik:v3.2
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks: ['onprem']
     depends_on:
-      - ollama-cpu
+      - n8n
+      # n8n:
+      #   condition: service_healthy
+    ports:
+      - 80:80
+      - 443:443
+      # - 8080:8080  # Add this line to expose the dashboard port
+    volumes:
+      - ./letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - "--log.level=DEBUG"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--certificatesresolvers.letsencrypt.acme.dnschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=route53"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.email=britchie@ridgetech.biz"
+      - "--entryPoints.web.address=:80"
+      - "--entryPoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.websecure.http.tls=true"
+      - "--entrypoints.websecure.http.tls.certResolver=letsencrypt"
+      # - "--entrypoints.websecure.http.tls.domains[0].main=n8n.motivation-inc.com"
+      # - "--entrypoints.websecure.http.tls.domains[0].main=traefik.n8n.motivation-inc.com"
+      - "--serversTransport.insecureSkipVerify=true"
+      # # Enable the dashboard
+      # - "--api.dashboard=true"
+      # - "--api.insecure=false"
+      # # Dashboard routing
+      # - "--entrypoints.dashboard.address=:8080"
+    # labels:
+    #   - "traefik.enable=true"
+    #   - "traefik.http.routers.dashboard.rule=Host(`traefik.n8n.motivation-inc.com`)"
+    #   - "traefik.http.routers.dashboard.entrypoints=websecure"
+    #   - "traefik.http.routers.dashboard.service=api@internal"
+    #   - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
+    #   - "traefik.http.middlewares.auth.basicauth.users=__TRAEFIK_DASHBOARD_HASHED_PASS__"
+    #   - "traefik.http.routers.dashboard.middlewares=auth"
 
-  ollama-pull-llama-gpu:
-    profiles: ["gpu-nvidia"]
-    <<: *init-ollama
-    depends_on:
-      - ollama-gpu
